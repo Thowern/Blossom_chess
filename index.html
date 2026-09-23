@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Blossom Chess</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #f2ecd6;
+         display: flex; flex-direction: column; align-items: center; padding: 20px; }
+  h1 { margin: 0 0 15px; font-weight: 500; }
+  #layout { display: flex; gap: 12px; align-items: flex-start; }
+  #boardWrap { position: relative; }
+  canvas#board { display: block; border: 6px solid #222; border-radius: 4px; cursor: pointer; }
+  #sidebar { width: 40px; height: 612px; display: flex; flex-direction: column;
+             border: 2px solid #222; border-radius: 4px; overflow: hidden; }
+  #blackBar { background: #9ecbc8; flex-grow: 1; transition: flex-grow .15s linear; }
+  #whiteBar { background: #fff;     flex-grow: 1; transition: flex-grow .15s linear; }
+  #controls { display: flex; gap: 10px; margin-top: 15px; align-items: center;
+              flex-wrap: wrap; justify-content: center; }
+  button { padding: 8px 16px; font-size: 14px; border: 1px solid #222;
+           border-radius: 4px; background: #fff; cursor: pointer; }
+  button:hover { background: #eee; }
+  label { font-size: 14px; display: flex; align-items: center; gap: 6px; }
+  #status { margin-top: 12px; min-height: 24px; font-size: 15px; color: #333; }
+  #overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+             display: none; align-items: center; justify-content: center; z-index: 10; }
+  #overlay.visible { display: flex; }
+  #dialog { background: #eee69a; border: 4px solid #222; border-radius: 6px;
+            padding: 20px; text-align: center; }
+  #dialog h3 { margin: 0 0 12px; }
+  #dialog .pieces { display: flex; gap: 10px; }
+  #dialog .pieces img { width: 60px; height: 60px; cursor: pointer;
+                        border: 1px solid #666; border-radius: 4px; background: #fff; }
+  #dialog .pieces img:hover { background: #b3b5e3; }
+  #endgame { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+             font-size: 40px; font-weight: bold; color: #3986f7;
+             text-shadow: 2px 2px 0 #f0b040; pointer-events: none; display: none;
+             white-space: nowrap; }
+  #loading { padding: 24px; font-size: 16px; }
+</style>
+</head>
+<body>
+  <h1>Blossom Chess</h1>
+  <div id="loading">Loading Python engine (Pyodide)…</div>
+
+  <div id="layout" style="display:none">
+    <div id="boardWrap">
+      <canvas id="board" width="600" height="600"></canvas>
+      <div id="endgame"></div>
+    </div>
+    <div id="sidebar">
+      <div id="blackBar"></div>
+      <div id="whiteBar"></div>
+    </div>
+  </div>
+
+  <div id="controls" style="display:none">
+    <button id="undoBtn">Undo</button>
+    <button id="flipBtn">Flip</button>
+    <button id="newBtn">New game</button>
+    <label><input type="checkbox" id="aiBlack" checked> AI nero</label>
+    <label><input type="checkbox" id="aiWhite"> AI bianco</label>
+  </div>
+  <div id="status"></div>
+
+  <div id="overlay">
+    <div id="dialog">
+      <h3>Promuovi a…</h3>
+      <div class="pieces"></div>
+    </div>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js"></script>
+<script>
+const PY_FILES = ['Blossom.py', 'Blossom_Brain_06.py',
+                  'Score_board_02_fast.py', 'convert.py', 'intermediate.py'];
+
+const PIECE_NAMES = ['wp','wR','wN','wB','wQ','wK',
+                     'bp','bR','bN','bB','bQ','bK'];
+const IMAGES = {};
+
+const SQ_COLOR_LIGHT = '#ffffff';
+const SQ_COLOR_DARK  = '#9ecbc8';
+
+// --- animazione: blocca a 60 FPS come clock.tick(60) del main.py ---
+const FRAME_MS = 1000 / 60;
+const FRAMES_PER_SQUARE = 5;   // ← alza questo valore per rallentare ancora
+let _lastFrame = 0;
+const nextFrame = () => new Promise(r => {
+  const wait = Math.max(0, FRAME_MS - (performance.now() - _lastFrame));
+  setTimeout(() => {
+    _lastFrame = performance.now();
+    requestAnimationFrame(r);
+  }, wait);
+});
+
+let pyodide = null;
+let state = null;
+let legalMoves = [];
+let selected = null;
+let flipped = false;
+let manualFlip = null;
+let aiBlack = true, aiWhite = false;
+let busy = false, gameOver = false;
+let currentScore = 0.5, targetScore = 0.5;
+
+const canvas = () => document.getElementById('board');
+const ctx2d  = () => canvas().getContext('2d');
+const SQ = () => canvas().width / 8;
+
+function preloadImages() {
+  return Promise.all(PIECE_NAMES.map(name => new Promise(resolve => {
+    const img = new Image();
+    img.onload  = () => { IMAGES[name] = img; resolve(); };
+    img.onerror = () => { console.warn('Immagine mancante:', 'imag/' + name + '.png'); resolve(); };
+    img.src = 'imag/' + name + '.png';
+  })));
+}
+
+async function init() {
+  try {
+    const imagesPromise = preloadImages();
+
+    pyodide = await loadPyodide({
+      indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.25.1/full/'
+    });
+    await pyodide.loadPackage('numpy');
+
+    for (const name of PY_FILES) {
+      const res = await fetch(name);
+      if (!res.ok) throw new Error(`Impossibile scaricare ${name} (${res.status})`);
+      const code = await res.text();
+      pyodide.FS.writeFile('/home/pyodide/' + name, code);
+    }
+
+    pyodide.runPython(`
+import sys
+sys.path.insert(0, '/home/pyodide')
+import intermediate
+`);
+
+    await imagesPromise;
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('layout').style.display = 'flex';
+    document.getElementById('controls').style.display = 'flex';
+
+    canvas().addEventListener('click', onClick);
+    document.getElementById('undoBtn').addEventListener('click', onUndo);
+    document.getElementById('newBtn').addEventListener('click', newGame);
+    document.getElementById('flipBtn').addEventListener('click', () => {
+      manualFlip = !(manualFlip === null ? flipped : manualFlip);
+      flipped = manualFlip;
+      draw();
+    });
+    document.getElementById('aiBlack').addEventListener('change',
+      e => { aiBlack = e.target.checked; updateAutoFlip(); maybeAI(); });
+    document.getElementById('aiWhite').addEventListener('change',
+      e => { aiWhite = e.target.checked; updateAutoFlip(); maybeAI(); });
+
+    newGame();
+    requestAnimationFrame(tick);
+  } catch (e) {
+    document.getElementById('loading').textContent = 'Errore: ' + e.message;
+    console.error(e);
+  }
+}
+
+function py(call) { return pyodide.runPython(call); }
+
+function newGame() {
+  state = JSON.parse(py('intermediate.new_game()'));
+  legalMoves = JSON.parse(py('intermediate.legal_moves()'));
+  selected = null;
+  gameOver = false;
+  manualFlip = null;
+  currentScore = 0.5;
+  targetScore  = 0.5;
+  document.getElementById('endgame').style.display = 'none';
+  setStatus('Partita nuova.');
+  updateAutoFlip();
+  draw();
+  maybeAI();
+}
+
+function flipRC(r, c, f) { return f ? [7 - r, 7 - c] : [r, c]; }
+
+function isHumanTurn() {
+  if (!state) return false;
+  return (state.white_to_move && !aiWhite) || (!state.white_to_move && !aiBlack);
+}
+function isAITurn() {
+  if (!state) return false;
+  return (state.white_to_move && aiWhite) || (!state.white_to_move && aiBlack);
+}
+
+function updateAutoFlip() {
+  if (!state) return;
+  if (manualFlip !== null) { flipped = manualFlip; return; }
+  if (isHumanTurn()) {
+    flipped = !state.white_to_move;
+  } else {
+    flipped = false;
+  }
+}
+
+// -------------------------------------------------------------------------
+//  ANIMAZIONE — replica di animate_move() del main.py, a 60 FPS fissi.
+//  La casa d'arrivo NON viene più coperta con grigio: viene ricoperta con
+//  il colore corretto della scacchiera, così resta dello stesso colore delle
+//  altre case.
+// -------------------------------------------------------------------------
+async function animateMove(from, to, prevBoard, boardForRender, animFlipped) {
+  const cv  = canvas();
+  const ctx = ctx2d();
+  const sq  = SQ();
+
+  const pieceMoved    = prevBoard[from[0]][from[1]];
+  const pieceCaptured = prevBoard[to[0]][to[1]];
+
+  const [start_r, start_c] = flipRC(from[0], from[1], animFlipped);
+  const [end_r,   end_c]   = flipRC(to[0],   to[1],   animFlipped);
+  const delta_row = end_r - start_r;
+  const delta_col = end_c - start_c;
+  const frame_count = (Math.abs(delta_row) + Math.abs(delta_col)) * FRAMES_PER_SQUARE;
+
+  // colore corretto della casa d'arrivo (in coordinate scacchiera)
+  const endColor = ((to[0] + to[1]) % 2 === 0) ? SQ_COLOR_LIGHT : SQ_COLOR_DARK;
+
+  for (let frame = 0; frame <= frame_count; frame++) {
+    let r, c;
+    if (frame_count) {
+      r = start_r + delta_row * frame / frame_count;
+      c = start_c + delta_col * frame / frame_count;
+    } else {
+      r = start_r;
+      c = start_c;
+    }
+
+    drawBoardOnly(ctx, cv, sq, animFlipped);
+    drawPiecesOnly(ctx, boardForRender, sq, animFlipped);
+
+    // ricopre la casa d'arrivo con il SUO colore corretto (non più grigio)
+    ctx.fillStyle = endColor;
+    ctx.fillRect(end_c * sq, end_r * sq, sq, sq);
+
+    if (pieceCaptured !== '--' && IMAGES[pieceCaptured]) {
+      ctx.drawImage(IMAGES[pieceCaptured], end_c * sq, end_r * sq, sq, sq);
+    }
+
+    if (IMAGES[pieceMoved]) {
+      ctx.drawImage(IMAGES[pieceMoved], c * sq, r * sq, sq, sq);
+    }
+
+    await nextFrame();
+  }
+}
+
+async function applyPythonMove(pyCall) {
+  const prevBoard = state.board.map(row => row.slice());
+  const prevFlipped = flipped;
+
+  const res = JSON.parse(py(pyCall));
+  if (!res) return false;
+
+  state = res;
+  legalMoves = JSON.parse(py('intermediate.legal_moves()'));
+  selected = null;
+  targetScore = py('intermediate.get_score()');
+
+  if (state.last_move) {
+    await animateMove(state.last_move.start, state.last_move.end,
+                      prevBoard, state.board, prevFlipped);
+  }
+
+  manualFlip = null;
+  updateAutoFlip();
+  updateEndgame();
+  draw();
+  return true;
+}
+
+function onClick(e) {
+  if (!state || gameOver || busy) return;
+  if (isAITurn() || !isHumanTurn()) return;
+
+  const cv = e.currentTarget;
+  const rct = cv.getBoundingClientRect();
+  const s = SQ();
+  const x = e.clientX - rct.left;
+  const y = e.clientY - rct.top;
+  const sc = Math.floor(x / s);
+  const sr = Math.floor(y / s);
+  if (sc < 0 || sc > 7 || sr < 0 || sr > 7) return;
+
+  const [r, c] = flipRC(sr, sc, flipped);
+
+  if (selected && selected[0] === r && selected[1] === c) {
+    selected = null; draw(); return;
+  }
+
+  if (selected) {
+    const from = selected, to = [r, c];
+    const legal = legalMoves.some(m =>
+      m[0][0] === from[0] && m[0][1] === from[1] &&
+      m[1][0] === to[0]   && m[1][1] === to[1]);
+    if (legal) {
+      const piece = state.board[from[0]][from[1]];
+      const isPromo = piece[1] === 'p' &&
+        ((piece[0] === 'w' && to[0] === 0) || (piece[0] === 'b' && to[0] === 7));
+      if (isPromo) {
+        showPromotion(piece[0]).then(choice => {
+          if (choice) doMove(from, to, choice);
+          else { selected = null; draw(); }
+        });
+      } else {
+        doMove(from, to, 'Q');
+      }
+      return;
+    }
+    const p = state.board[r][c];
+    if (p !== '--' && ((p[0] === 'w') === state.white_to_move)) {
+      selected = [r, c];
+    } else {
+      selected = null;
+    }
+    draw();
+    return;
+  }
+
+  const p = state.board[r][c];
+  if (p !== '--' && ((p[0] === 'w') === state.white_to_move)) {
+    selected = [r, c];
+    draw();
+  }
+}
+
+async function doMove(from, to, promotion) {
+  if (busy) return;
+  busy = true;
+  try {
+    await applyPythonMove(
+      `intermediate.try_move(${from[0]}, ${from[1]}, ${to[0]}, ${to[1]}, '${promotion}')`);
+  } catch (e) {
+    console.error(e); setStatus('Errore: ' + e.message);
+  } finally {
+    busy = false;
+  }
+  maybeAI();
+}
+
+function maybeAI() {
+  if (!state || gameOver || busy) return;
+  if (!isAITurn()) {
+    if (!gameOver) setStatus(state.white_to_move ? 'Muove il bianco.' : 'Muove il nero.');
+    return;
+  }
+  busy = true;
+  setStatus('L’AI sta pensando…');
+  setTimeout(async () => {
+    try {
+      await applyPythonMove('intermediate.ai_move()');
+    } catch (e) {
+      console.error(e); setStatus('Errore AI: ' + e.message);
+    } finally {
+      busy = false;
+    }
+    maybeAI();
+  }, 20);
+}
+
+function onUndo() {
+  if (busy || !state || state.move_log_len === 0) return;
+  let s = JSON.parse(py('intermediate.undo()'));
+  const wasAI = (s.white_to_move && aiWhite) || (!s.white_to_move && aiBlack);
+  if (wasAI && s.move_log_len > 0) {
+    s = JSON.parse(py('intermediate.undo()'));
+  }
+  state = s;
+  legalMoves = JSON.parse(py('intermediate.legal_moves()'));
+  selected = null;
+  gameOver = false;
+  manualFlip = null;
+  document.getElementById('endgame').style.display = 'none';
+  targetScore = py('intermediate.get_score()');
+  updateAutoFlip();
+  draw();
+}
+
+function updateEndgame() {
+  const eg = document.getElementById('endgame');
+  if (state.checkmate) {
+    eg.textContent = state.white_to_move ? 'Vince il nero' : 'Vince il bianco';
+    eg.style.display = 'block'; gameOver = true;
+    setStatus('Scacco matto.');
+  } else if (state.stalemate) {
+    eg.textContent = 'Stallo'; eg.style.display = 'block'; gameOver = true;
+    setStatus('Stallo.');
+  } else if (state.draw) {
+    eg.textContent = 'Patta'; eg.style.display = 'block'; gameOver = true;
+    setStatus('Patta.');
+  }
+}
+
+function showPromotion(color) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('overlay');
+    const cont = overlay.querySelector('.pieces');
+    cont.innerHTML = '';
+    for (const p of ['Q', 'R', 'B', 'N']) {
+      const key = color + p;
+      const img = document.createElement('img');
+      img.src = 'imag/' + key + '.png';
+      img.alt = key;
+      img.addEventListener('click', () => {
+        overlay.classList.remove('visible');
+        document.removeEventListener('keydown', onEsc);
+        resolve(p);
+      });
+      cont.appendChild(img);
+    }
+    const onEsc = ev => {
+      if (ev.key === 'Escape') {
+        overlay.classList.remove('visible');
+        document.removeEventListener('keydown', onEsc);
+        resolve(null);
+      }
+    };
+    document.addEventListener('keydown', onEsc);
+    overlay.classList.add('visible');
+  });
+}
+
+// -------------------------------------------------------------------------
+//  RENDERING
+// -------------------------------------------------------------------------
+function drawBoardOnly(ctx, cv, sq, f) {
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const [sr, sc] = flipRC(r, c, f);
+      ctx.fillStyle = (r + c) % 2 === 0 ? SQ_COLOR_LIGHT : SQ_COLOR_DARK;
+      ctx.fillRect(sc * sq, sr * sq, sq, sq);
+    }
+  }
+}
+
+function drawGrid(ctx, cv, sq) {
+  ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 8; i++) {
+    ctx.beginPath(); ctx.moveTo(i * sq, 0); ctx.lineTo(i * sq, cv.height); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, i * sq); ctx.lineTo(cv.width, i * sq); ctx.stroke();
+  }
+}
+
+function drawPiecesOnly(ctx, board, sq, f) {
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const piece = board[r][c];
+      if (piece === '--') continue;
+      const [sr, sc] = flipRC(r, c, f);
+      const img = IMAGES[piece];
+      if (img) ctx.drawImage(img, sc * sq, sr * sq, sq, sq);
+    }
+  }
+}
+
+function draw() {
+  if (!state) return;
+  const cv  = canvas();
+  const ctx = ctx2d();
+  const sq  = SQ();
+
+  drawBoardOnly(ctx, cv, sq, flipped);
+
+  if (state.last_move) {
+    ctx.fillStyle = '#b7e6bb';
+    for (const pos of [state.last_move.start, state.last_move.end]) {
+      const [sr, sc] = flipRC(pos[0], pos[1], flipped);
+      ctx.fillRect(sc * sq, sr * sq, sq, sq);
+    }
+  }
+
+  if (selected) {
+    const [sr, sc] = flipRC(selected[0], selected[1], flipped);
+    ctx.fillStyle = '#b3b5e3';
+    ctx.fillRect(sc * sq, sr * sq, sq, sq);
+    ctx.fillStyle = '#eee69a';
+    for (const m of legalMoves) {
+      if (m[0][0] === selected[0] && m[0][1] === selected[1]) {
+        const [dr, dc] = flipRC(m[1][0], m[1][1], flipped);
+        ctx.fillRect(dc * sq, dr * sq, sq, sq);
+      }
+    }
+  }
+
+  if (state.in_check) {
+    const [sr, sc] = flipRC(state.king_square[0], state.king_square[1], flipped);
+    ctx.fillStyle = '#f0b040';
+    ctx.fillRect(sc * sq, sr * sq, sq, sq);
+  }
+
+  drawGrid(ctx, cv, sq);
+  drawPiecesOnly(ctx, state.board, sq, flipped);
+}
+
+function tick() {
+  const step = 0.01;
+  if (Math.abs(currentScore - targetScore) < 0.005) currentScore = targetScore;
+  else if (currentScore < targetScore) currentScore = Math.min(currentScore + step, targetScore);
+  else currentScore = Math.max(currentScore - step, targetScore);
+
+  const wb = document.getElementById('whiteBar');
+  const bb = document.getElementById('blackBar');
+  wb.style.flexGrow = currentScore * 100;
+  bb.style.flexGrow = (1 - currentScore) * 100;
+
+  requestAnimationFrame(tick);
+}
+
+function setStatus(m) { document.getElementById('status').textContent = m; }
+
+init();
+</script>
+</body>
+</html>
