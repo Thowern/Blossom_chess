@@ -375,9 +375,21 @@ function isAITurn() {
 function updateAutoFlip() {
   if (!state) return;
   if (manualFlip !== null) { flipped = manualFlip; return; }
-  if (isHumanTurn()) {
+
+  const humanIsWhite = !aiWhite;
+  const humanIsBlack = !aiBlack;
+
+  if (humanIsWhite && humanIsBlack) {
+    // entrambi i lati sono umani (hotseat): ruota in base a chi muove
     flipped = !state.white_to_move;
+  } else if (humanIsBlack) {
+    // solo il nero è umano: vista sempre da nero
+    flipped = true;
+  } else if (humanIsWhite) {
+    // solo il bianco è umano: vista sempre da bianco
+    flipped = false;
   } else {
+    // entrambi AI: vista di default da bianco
     flipped = false;
   }
 }
